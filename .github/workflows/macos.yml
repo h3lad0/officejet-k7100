@@ -1,0 +1,20 @@
+name: macOS driver
+
+on:
+  push:
+    paths: ['macos/**', '.github/workflows/macos.yml']
+  pull_request:
+    paths: ['macos/**', '.github/workflows/macos.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # Без DMG HP: пакет собирается без иконки принтера и содержит только открытый код.
+      - run: macos/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HP-Officejet-K7100-macOS
+          path: macos/dist/*.pkg

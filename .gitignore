@@ -1,0 +1,12 @@
+# Файлы HP не распространяются: каждый скачивает их сам
+*/vendor/*
+!*/vendor/README.md
+*.dmg
+*.exe
+
+# Результаты сборки
+*/build/
+*/dist/
+macos/sources/*.tar.gz
+
+.DS_Store
