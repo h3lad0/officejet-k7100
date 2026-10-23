@@ -1,0 +1,83 @@
+#!/bin/bash
+# Обслуживание HP Officejet K7100 из терминала.
+#
+#   k7100 [-p очередь] status              состояние и оценка уровня чернил
+#   k7100 [-p очередь] clean [1|2|3]       чистка печатающих головок (3 — самая глубокая)
+#   k7100 [-p очередь] align               автоматическое выравнивание (загрузите бумагу A4/Letter)
+#   k7100 [-p очередь] reset-ink [black|color|all]
+#                                          сбросить оценку чернил после заправки/замены
+#
+# Без -p используется первая очередь с драйвером K7100 (hpcups).
+set -euo pipefail
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+PRINTER=""
+while getopts "p:h" opt; do
+    case $opt in
+        p) PRINTER=$OPTARG ;;
+        h) usage ;;
+        *) usage 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage 1
+
+if [ -z "$PRINTER" ]; then
+    for p in $(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}'); do
+        if grep -q "HP Officejet K7100 (hpcups" "/etc/cups/ppd/$p.ppd" 2>/dev/null ||
+           lpoptions -p "$p" 2>/dev/null | grep -q "printer-make-and-model='HP Officejet K7100 (hpcups"; then
+            PRINTER=$p; break
+        fi
+    done
+fi
+[ -n "$PRINTER" ] || { echo "Не найдена очередь с драйвером K7100; укажите её: -p <имя>" >&2; exit 1; }
+
+command_job() { # title, command lines...
+    local title=$1; shift
+    printf '#CUPS-COMMAND\n%s\n' "$@" |
+        lp -d "$PRINTER" -t "$title" -o document-format=application/vnd.cups-command >/dev/null
+}
+
+wait_jobs() { # дождаться выполнения командного задания (до 30 с)
+    for _ in $(seq 30); do
+        lpstat -o "$PRINTER" 2>/dev/null | grep -q . || return 0
+        sleep 1
+    done
+}
+
+show_status() {
+    ipptool -tv "ipp://localhost/printers/$PRINTER" get-printer-attributes.test 2>/dev/null |
+        awk -F' = ' '
+            /marker-names/        { gsub(/ /, "", $2); split($2, n, ",") }
+            /marker-levels/       { gsub(/ /, "", $2); split($2, l, ",") }
+            /printer-state-reasons/ { r = $2 }
+            END {
+                if (!length(n)) { print "Уровни ещё не получены: напечатайте что-нибудь или повторите status."; }
+                else for (i = 1; i in n; i++)
+                    printf "%-8s %s\n", n[i], (l[i] < 0 ? "неизвестно" : l[i] "% (оценка)");
+                print "Состояние: " r
+            }'
+}
+
+case $1 in
+    status)
+        command_job "K7100 status" "ReportLevels"
+        wait_jobs
+        show_status ;;
+    clean)
+        level=${2:-1}
+        [[ $level =~ ^[123]$ ]] || usage 1
+        command_job "K7100 clean $level" "Clean $level"
+        echo "Отправлена чистка головок, уровень $level." ;;
+    align)
+        command_job "K7100 align" "AutoAlign"
+        echo "Отправлено выравнивание: принтер напечатает и просканирует страницу." ;;
+    reset-ink)
+        which=${2:-all}
+        [[ $which =~ ^(black|color|all)$ ]] || usage 1
+        command_job "K7100 reset ink" "ResetInk $which"
+        wait_jobs
+        show_status ;;
+    *) usage 1 ;;
+esac

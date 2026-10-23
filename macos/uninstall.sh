@@ -6,5 +6,6 @@ set -euo pipefail
 
 rm -rf /Library/Printers/HP_K7100
 rm -f "/Library/Printers/PPDs/Contents/Resources/HP Officejet K7100 (hpcups).ppd.gz"
+rm -f /private/var/spool/cups/cache/HP_K7100-*.ink   # оценка расхода чернил
 pkgutil --forget org.local.hp.officejet.k7100 2>/dev/null || true
 echo "Драйвер удалён."

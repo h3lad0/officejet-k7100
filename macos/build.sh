@@ -3,13 +3,15 @@
 #
 # Оригинальный драйвер HP v9.7 (2008) содержит только PPC/i386 бинарники и не
 # запускается на macOS 10.15+. Здесь фильтр растеризации пересобирается из
-# открытого HP HPLIP (hpcups, язык PCL3GUI2 — тот же, что использовал HP), а PPD
-# собирается из HPLIP-описания K7100 с иконкой из оригинального DMG.
+# открытого HP HPLIP (hpcups, язык PCL3GUI2 — тот же, что использовал HP) с
+# расширениями src/k7100_ext.* (статус и оценка чернил, цветовые настройки HP),
+# а PPD — из HPLIP-описания K7100 с параметрами старого драйвера HP
+# (tools/patch_ppd.py). Из оригинального DMG берутся иконка и ICC-профили.
 set -euo pipefail
 
 HPLIP_VER=3.26.4
 JPEG_VER=9f
-DRIVER_VER=1.0.0
+DRIVER_VER=1.1.0
 MIN_MACOS=11.0
 ARCHS="-arch arm64 -arch x86_64"
 
@@ -32,13 +34,11 @@ fetch "https://www.ijg.org/files/jpegsrc.v$JPEG_VER.tar.gz" "jpegsrc.v$JPEG_VER.
 (cd "$SRC" && shasum -a 256 -c SHA256SUMS)
 
 H="$BUILD/hplip-$HPLIP_VER"
-if [ ! -d "$H" ]; then
+if [ ! -f "$H/.patched" ]; then
+    rm -rf "$H" "$BUILD/obj"
     tar xzf "$SRC/hplip-$HPLIP_VER.tar.gz" -C "$BUILD"
-    # APFS нечувствительна к регистру: "utils.h" (common/) перекрывается
-    # prnt/hpcups/Utils.h. Переименовываем общий заголовок.
-    cp "$H/common/utils.h" "$H/common/hplip_common_utils.h"
-    grep -l '#include "utils.h"' "$H"/prnt/hpcups/*.c* "$H"/common/*.c |
-        xargs sed -i '' 's/#include "utils.h"/#include "hplip_common_utils.h"/'
+    python3 -I "$ROOT/tools/patch_hplip.py" "$H"
+    touch "$H/.patched"
 fi
 
 # --- 2. libjpeg (статически, universal) -------------------------------------
@@ -57,58 +57,74 @@ O="$BUILD/obj"
 mkdir -p "$O"
 FLAGS=(-O2 $ARCHS -mmacosx-version-min=$MIN_MACOS
        -DAPDK_LITTLE_ENDIAN -DDISABLE_IMAGEPROCESSOR -DCONFDIR="\"$PREFIX/etc\""
-       -I"$ROOT/compat" -I"$H/prnt/hpcups" -I"$H/common" -I"$H/io/hpmud" -I"$H" -I"$J/include"
+       -I"$ROOT/compat" -I"$ROOT/src" -I"$H/prnt/hpcups" -I"$H/common" -I"$H/io/hpmud" -I"$H" -I"$J/include"
        -Wno-deprecated-declarations -w)
 
 # Список исходников берётся из Makefile.am HPLIP (D-Bus отключён: HAVE_DBUS не определён).
 SOURCES=$(sed -n '/^hpcups_SOURCES/,/^$/p' "$H/Makefile.am" | tr ' \\\t' '\n\n\n' |
           grep -E '\.(c|cpp)$')
 
+compile() { # source object
+    [ "$2" -nt "$1" ] && [ "$2" -nt "$ROOT/src/k7100_ext.h" ] && return
+    case "$1" in
+        *.c)   clang   "${FLAGS[@]}"                -c "$1" -o "$2" ;;
+        *.cpp) clang++ "${FLAGS[@]}" -std=gnu++11 -c "$1" -o "$2" ;;
+    esac
+}
+
 OBJS=()
 for f in $SOURCES; do
     o="$O/$(echo "${f%.*}" | tr / _).o"   # с путём: common/utils.c ≠ prnt/hpcups/Utils.cpp
     OBJS+=("$o")
-    [ "$o" -nt "$H/$f" ] && continue
-    case "$f" in
-        *.c)   clang   "${FLAGS[@]}"                -c "$H/$f" -o "$o" ;;
-        *.cpp) clang++ "${FLAGS[@]}" -std=gnu++11 -c "$H/$f" -o "$o" ;;
-    esac
+    compile "$H/$f" "$o"
 done
+compile "$ROOT/src/k7100_ext.cpp" "$O/k7100_ext.o"
+compile "$ROOT/src/commandtok7100.cpp" "$O/commandtok7100.o"
 
 STAGE="$BUILD/root"
 rm -rf "$STAGE"
-mkdir -p "$STAGE$PREFIX/filter" "$STAGE$PREFIX/Resources" "$STAGE/Library/Printers/PPDs/Contents/Resources"
-clang++ $ARCHS -mmacosx-version-min=$MIN_MACOS -o "$STAGE$PREFIX/filter/hpcups" "${OBJS[@]}" \
+mkdir -p "$STAGE$PREFIX/filter" "$STAGE$PREFIX/bin" "$STAGE$PREFIX/Resources" \
+         "$STAGE/Library/Printers/PPDs/Contents/Resources"
+LINK=(clang++ $ARCHS -mmacosx-version-min=$MIN_MACOS)
+"${LINK[@]}" -o "$STAGE$PREFIX/filter/hpcups" "${OBJS[@]}" "$O/k7100_ext.o" \
     "$J/lib/libjpeg.a" -lcups -lcupsimage -lz
-strip -x "$STAGE$PREFIX/filter/hpcups"
-codesign --force -s - "$STAGE$PREFIX/filter/hpcups"   # ad-hoc, иначе arm64 не запустит
-lipo -info "$STAGE$PREFIX/filter/hpcups"
+"${LINK[@]}" -o "$STAGE$PREFIX/filter/commandtok7100" "$O/commandtok7100.o" "$O/k7100_ext.o" -lcups
+for f in hpcups commandtok7100; do
+    strip -x "$STAGE$PREFIX/filter/$f"
+    codesign --force -s - "$STAGE$PREFIX/filter/$f"   # ad-hoc, иначе arm64 не запустит
+    lipo -info "$STAGE$PREFIX/filter/$f"
+done
+install -m 755 "$ROOT/src/k7100" "$STAGE$PREFIX/bin/k7100"
 
-# --- 4. Иконка из оригинального DMG HP ------------------------------------
-# ICC-профили HP не переносим: они описывают цветовой тракт старого драйвера HP,
-# а hpcups использует собственные таблицы цветоделения.
+# --- 4. Иконка и ICC-профили из оригинального DMG HP ------------------------
+# Профили HP построены для того же VIP-режима (RGB в принтер), что использует
+# hpcups; применяются, когда в «Цветовом режиме» выбран ColorSync.
 if [ -f "$DMG" ]; then
     MNT="$BUILD/mnt"
     mkdir -p "$MNT"
     hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >/dev/null
     trap 'hdiutil detach -quiet "$MNT" || true' EXIT
     PKG="$MNT/HP Installer.app/Contents/Packages/HP Officejet Printer drivers-CUPS.mpkg/Contents/Packages/HP Officejet Printer drivers.pkg/Contents/Archive.pax.gz"
-    ICON=./hp/cups/Officejet.driver/Contents/Resources/PrinterIcons/K7100.icns
-    (cd "$BUILD" && gunzip -c "$PKG" | pax -r "$ICON")
-    cp "$BUILD/$ICON" "$STAGE$PREFIX/Resources/"
+    rm -rf "$BUILD/hp"
+    (cd "$BUILD" && gunzip -c "$PKG" |
+        pax -r './hp/cups/Officejet.driver/Contents/Resources/PrinterIcons/K7100.icns' './hp/Profiles/business-inkjet/HP K7100-*')
+    cp "$BUILD/hp/cups/Officejet.driver/Contents/Resources/PrinterIcons/K7100.icns" "$STAGE$PREFIX/Resources/"
+    mkdir -p "$STAGE$PREFIX/Profiles"
+    cp "$BUILD"/hp/Profiles/business-inkjet/HP\ K7100-*.icc "$STAGE$PREFIX/Profiles/"
     hdiutil detach -quiet "$MNT"; trap - EXIT
 else
-    echo "ВНИМАНИЕ: $DMG не найден — пакет будет без иконки принтера" >&2
+    echo "ВНИМАНИЕ: $DMG не найден — пакет будет без иконки принтера и профилей ColorSync" >&2
 fi
 
 # --- 5. PPD -----------------------------------------------------------------
 PPD="$STAGE/Library/Printers/PPDs/Contents/Resources/HP Officejet K7100 (hpcups).ppd"
 gunzip -c "$H/ppd/hpcups/hp-officejet_k7100.ppd.gz" | python3 -I "$ROOT/tools/patch_ppd.py" \
     --prefix "$PREFIX" --version "$DRIVER_VER" \
-    $( [ -f "$STAGE$PREFIX/Resources/K7100.icns" ] && echo --icon ) > "$PPD"
+    $( [ -f "$STAGE$PREFIX/Resources/K7100.icns" ] && echo --icon ) \
+    $( [ -d "$STAGE$PREFIX/Profiles" ] && echo --profiles ) > "$PPD"
 # В staging файлы принадлежат пользователю; владельца root выставит pkgbuild,
 # поэтому замечания о правах игнорируем, а любые другие FAIL — ошибка сборки.
-TESTPPD=$(cupstestppd -R "$STAGE" -W translations -W sizes "$PPD" || true)
+TESTPPD=$(cupstestppd -R "$STAGE" -W sizes "$PPD" || true)
 if echo "$TESTPPD" | grep '\*\*FAIL\*\*' | grep -v "Bad permissions"; then
     exit 1
 fi
